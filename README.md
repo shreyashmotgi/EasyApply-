@@ -30,6 +30,17 @@ After updating the code, click the reload icon on the extension card.
   The model returns small find-and-replace edits (not the whole file), which saves tokens
   and keeps your template untouched. It may only use facts already in your resume plus the
   skills you ticked.
+- **Contact emails:** looks for a recruiter or HR address in the job post (text, mailto links,
+  Cloudflare-hidden addresses), then on the company's own website (Contact, Careers, About,
+  Team pages). Addresses are read from live pages only: never guessed and never recalled by an
+  AI model, so old remembered emails cannot appear. Junk (noreply, privacy, third-party
+  addresses) is removed, and addresses on a domain with no mail server are dropped (checked
+  through Cloudflare's public DNS service, which sees only the domain name). Old or closed
+  postings get a warning. No tool can confirm a mailbox is still monitored.
+- **Cold email:** writes a short email from the job, your resume and the skills you ticked,
+  plus a follow-up and a LinkedIn note. "Open in Gmail" opens Gmail on the web with the
+  recipient, subject and body filled in. You attach your resume and press Send yourself.
+  Nothing is ever sent automatically.
 - **Follow-up chat** about the job and your resume.
 
 ## Limits and notes
@@ -43,9 +54,10 @@ After updating the code, click the reload icon on the extension card.
 - Very long LaTeX files are cut to the first 12,000 characters before sending.
 - Always compile the new LaTeX in Overleaf and check the PDF before applying.
 - Your resume and the page text are sent to Groq to produce the results.
+- The extension fetches the company's public pages from your own browser, like visiting them.
 
 ## Files
 - manifest.json, background.js: extension setup
 - sidepanel.html / .css / .js: the panel UI and logic
-- utils.js: LaTeX edit and risk helpers (pure functions)
+- utils.js: LaTeX edit, risk, email-finding and cold-email helpers (pure functions)
 - lib/: PDF.js, used to read PDF resumes

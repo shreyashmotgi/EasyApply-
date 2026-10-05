@@ -112,3 +112,17 @@ a { color: var(--accent); }
 .edit-card pre.before { background: var(--gap-bg); }
 .edit-card pre.after { background: var(--good-bg); }
 #tailorOut button.primary, #tailorOut .btn-row { margin-top: 10px; }
+
+/* ---------- contacts and cold email ---------- */
+select { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); font: inherit; }
+.contact { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+.contact .addr { font-weight: 700; word-break: break-all; }
+.contact .meta { color: var(--muted); font-size: 12.5px; }
+.contact button { margin-top: 6px; padding: 4px 10px; }
+.badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px; margin: 4px 4px 0 0; }
+.badge.ok { background: var(--good-bg); color: var(--good); }
+.badge.bad { background: var(--gap-bg); color: var(--gap); }
+#emailOut textarea { font: inherit; }
+#emailOut details { margin-top: 10px; }
+.count { color: var(--muted); font-size: 12px; text-align: right; }

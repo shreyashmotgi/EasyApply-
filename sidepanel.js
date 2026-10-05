@@ -81,8 +81,9 @@ function linkEl(url, text) {
 
 /* ---------- settings, resume, LaTeX storage ---------- */
 async function loadState() {
-  const s = await chrome.storage.local.get(["apiKey", "model", "searchModel", "resume", "resumeName", "latex"]);
+  const s = await chrome.storage.local.get(["apiKey", "model", "searchModel", "resume", "resumeName", "latex", "userName"]);
   if (s.apiKey) $("apiKey").value = s.apiKey;
+  if (s.userName) $("userName").value = s.userName;
   if (s.model) $("model").value = s.model;
   if (s.searchModel && /^groq\/compound/.test(s.searchModel)) {
     s.searchModel = DEFAULT_SEARCH_MODEL;            // retired model: switch automatically
@@ -101,6 +102,7 @@ function showResumeStatus(resume, name) {
 function showLatexStatus(latex, extra = "") {
   $("latexStatus").textContent = (latex ? `LaTeX resume saved (${latex.length} characters).` : "No LaTeX resume saved.") + extra;
 }
+$("userName").addEventListener("change", () => chrome.storage.local.set({ userName: sanitizeName($("userName").value) }));
 $("saveSettings").addEventListener("click", async () => {
   await chrome.storage.local.set({
     apiKey: $("apiKey").value.trim(),
@@ -177,14 +179,23 @@ async function readActivePage() {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: () => {
-      const sel = String(window.getSelection() || "").trim();
-      return { title: document.title, url: location.href, selection: sel, text: document.body ? document.body.innerText : "" };
+      const sel = window.getSelection();
+      const selText = sel ? String(sel).trim() : "";
+      const useSel = selText.length > 300;
+      let root = document.body;
+      if (useSel) { root = document.createElement("div"); root.appendChild(sel.getRangeAt(0).cloneContents()); }
+      return {
+        title: document.title, url: location.href, usedSelection: useSel,
+        text: (useSel ? selText : (document.body ? document.body.innerText : "")).slice(0, 300000),
+        mailtos: [...root.querySelectorAll('a[href^="mailto:" i]')].slice(0, 20).map((a) => a.getAttribute("href")),
+        cf: [...root.querySelectorAll("[data-cfemail]")].slice(0, 20).map((a) => a.getAttribute("data-cfemail")),
+      };
     },
   });
   const r = res.result;
-  const useSel = r.selection.length > 300;
-  const text = (useSel ? r.selection : r.text).replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-  return { title: r.title, url: r.url, text: text.slice(0, MAX_PAGE_CHARS), usedSelection: useSel };
+  const full = r.text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return { title: r.title, url: r.url, text: full.slice(0, MAX_PAGE_CHARS), fullText: full,
+    mailtos: r.mailtos || [], cf: r.cf || [], usedSelection: r.usedSelection };
 }
 
 /* ---------- Groq ---------- */
@@ -265,6 +276,7 @@ Return ONLY valid JSON in exactly this shape:
  "missing_skills": [string],
  "resume_edits": [{"section": string, "issue": string, "suggestion": string}],
  "company_info": {"summary": string, "industry": string, "size_or_stage": string, "location": string},
+ "contact_person": string (name of a recruiter or contact person named in the posting for applications, otherwise ""),
  "jd_summary": string (under 120 words: main responsibilities and requirements),
  "jd_keywords": [string] (up to 20 important skills, tools and keywords from the job)
 }
@@ -503,7 +515,7 @@ async function checkCompany(analysis, page, id) {
   const name = (analysis.company || "").trim();
   if (!name || /^(not mentioned|company|unknown|n\/a)$/i.test(name)) {
     renderCompany(null, local, "The company name was not found on this page, so the web check was skipped.", analysis);
-    return;
+    return null;
   }
   renderCompany(null, local, `Searching the web for ${name}...`, analysis);
   try {
@@ -514,9 +526,11 @@ async function checkCompany(analysis, page, id) {
       });
       if (data.level !== "unknown") await setCachedCompany(name, data);
     }
-    if (id === runId) renderCompany(data, local, "", analysis);
+    if (id === runId) { renderCompany(data, local, "", analysis); if (current) current.company = data; }
+    return data;
   } catch (e) {
     if (id === runId) renderCompany(null, local, "Company web check unavailable: " + e.message, analysis);
+    return null;
   }
 }
 
@@ -679,12 +693,272 @@ function buildResult(latex, res) {
   res.append(ta, row, el("p", "note", "Paste this into Overleaf, compile it, and check that the PDF still looks right and fits one page before you apply."));
 }
 
+/* ---------- contact emails (read from live pages only, never guessed) ---------- */
+const mxCache = new Map();
+const NOT_COMPANY_SITE = /(^|\.)(linkedin|naukri|indeed|glassdoor|instahyre|foundit|monster|ziprecruiter|wellfound|angel|facebook|instagram|twitter|x|youtube|google)\.[a-z.]+$/;
+
+async function mxLookup(domain) {
+  if (mxCache.has(domain)) return mxCache.get(domain);
+  let verdict = null;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 6000);
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`,
+      { headers: { accept: "application/dns-json" }, signal: ctl.signal });
+    verdict = mxVerdict(await r.json());
+  } catch { verdict = null; }
+  finally { clearTimeout(timer); }
+  mxCache.set(domain, verdict);
+  return verdict;
+}
+async function fetchPage(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 7000);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, credentials: "omit", redirect: "follow" });
+    if (!r.ok) return null;
+    return { url: r.url || url, text: (await r.text()).slice(0, 500000) };
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+const SITE_PATHS = ["/", "/contact", "/contact-us", "/careers", "/jobs", "/about", "/about-us", "/team"];
+async function crawlSite(host) {
+  const base = "https://" + host;
+  const pages = (await Promise.all(SITE_PATHS.map((p) => fetchPage(base + p)))).filter(Boolean);
+  const found = [], seen = new Set();
+  pages.forEach((pg) => {
+    const h = hostFromUrl(pg.url);
+    if (!h || !emailDomainMatches("x@" + h, host)) return;   // redirected to another site: ignore
+    if (seen.has(pg.url)) return;
+    seen.add(pg.url);
+    extractEmails(pg.text).forEach((e) => found.push({ email: e, source: "company website", url: pg.url }));
+  });
+  return { found, pages: seen.size };
+}
+function emailsFromPage(page) {
+  const out = [...extractEmails(page.fullText || page.text)];
+  (page.mailtos || []).forEach((m) => {
+    let d = m; try { d = decodeURIComponent(m); } catch {}
+    extractEmails(d).forEach((e) => out.push(e));
+  });
+  (page.cf || []).forEach((h) => extractEmails(cfDecode(h)).forEach((e) => out.push(e)));
+  return [...new Set(out)];
+}
+function pickCompanyHost(data, postFound) {
+  if (data && data.website) {
+    const h = hostFromUrl(data.website);
+    if (h && !NOT_COMPANY_SITE.test(h)) return h;
+  }
+  const own = pickContacts(postFound, null).find((c) => c.kind !== "free");   // domain of a non-free address in the post
+  return own ? own.email.split("@")[1] : null;
+}
+async function finalizeContacts(found, host) {
+  const list = pickContacts(found, host);
+  await Promise.all([...new Set(list.map((c) => c.email.split("@")[1]))].map((d) => mxLookup(d)));
+  const kept = [], dropped = [];
+  list.forEach((c) => {
+    const v = mxCache.get(c.email.split("@")[1]);
+    (v === false ? dropped : kept).push({ ...c, mx: v });
+  });
+  return { kept, dropped };
+}
+function renderContacts({ list, note = "", warnings = [], dropped = 0, busy = false }) {
+  const box = $("contactBox");
+  box.hidden = false;
+  box.replaceChildren(el("h2", "", "Contact emails"));
+  warnings.forEach((w) => box.appendChild(el("p", "warn", w)));
+  if (note) box.appendChild(el("div", "hint", note));
+  const groups = [["hr", "Recruiting or HR"], ["general", "General company address"],
+    ["person", "Named people"], ["free", "Free email address (be careful)"]];
+  groups.forEach(([kind, title]) => {
+    const items = list.filter((c) => c.kind === kind);
+    if (!items.length) return;
+    box.appendChild(el("h3", "", title));
+    items.forEach((c) => {
+      const d = el("div", "contact");
+      d.appendChild(el("div", "addr", c.email));
+      const meta = el("div", "meta", c.source === "job post" ? "Found in the job post " : "Found on the company website ");
+      if (c.source !== "job post" && c.url) meta.appendChild(linkEl(c.url));
+      d.appendChild(meta);
+      if (c.mx === true) d.appendChild(el("span", "badge ok", "mail server found"));
+      else if (c.mx === null && c.mx !== undefined) d.appendChild(el("span", "badge bad", "mail server not checked"));
+      if (c.domainMatch === false) d.appendChild(el("span", "badge bad", "domain differs from the company website"));
+      if (c.kind === "free") d.appendChild(el("div", "warn", "Free email addresses are common in scam postings. Verify the company first."));
+      const use = el("button", "secondary", "Use for email");
+      use.addEventListener("click", () => {
+        $("emailTo").value = c.email;
+        use.textContent = "Selected";
+        $("emailBox").scrollIntoView({ block: "nearest" });
+      });
+      d.appendChild(use);
+      box.appendChild(d);
+    });
+  });
+  if (!list.length && !busy) {
+    box.appendChild(el("p", "", "No recruiter or HR email was found on the job post or on the company website. Many companies do not publish one. You can type an address in the Cold email box yourself."));
+  }
+  if (dropped) box.appendChild(el("p", "hint", `${dropped} address(es) were removed because their domain has no mail server.`));
+  box.appendChild(el("p", "note", "Addresses are read from live pages only. They are never guessed or recalled by an AI model. The extension checks that the domain has a mail server, but nobody can confirm that the mailbox is still monitored."));
+}
+async function runContacts(analysis, page, id, companyPromise) {
+  const warnings = [];
+  const age = postingAgeWarning(page.fullText);
+  if (age) warnings.push(age);
+  if (postingClosed(page.fullText)) warnings.push("This posting may be closed, so any contact below may no longer be used.");
+  const postFound = emailsFromPage(page).map((e) => ({ email: e, source: "job post", url: page.url }));
+  renderContacts({ list: pickContacts(postFound, null), warnings, busy: true, note: "Looking for the company website..." });
+  const data = await companyPromise.catch(() => null);
+  if (id !== runId) return;
+  const host = pickCompanyHost(data, postFound);
+  const found = [...postFound];
+  let note;
+  if (host) {
+    renderContacts({ list: pickContacts(postFound, host), warnings, busy: true, note: `Reading pages on ${host}...` });
+    const crawl = await crawlSite(host);
+    if (id !== runId) return;
+    found.push(...crawl.found);
+    note = `Checked the job post and ${crawl.pages} page(s) on ${host}.`;
+  } else {
+    note = "The company website could not be identified, so only the job post was checked.";
+  }
+  const { kept, dropped } = await finalizeContacts(found, host);
+  if (id !== runId) return;
+  renderContacts({ list: kept, warnings, note, dropped: dropped.length });
+}
+
+/* ---------- cold email ---------- */
+const EMAIL_SYSTEM = `You write short, honest job-application emails for a candidate.
+RULES:
+- Use only facts from the RESUME and the CONFIRMED SKILLS list. Never invent experience, numbers, employers, referrals or relationships. Never say the candidate was referred by, or has spoken to, anyone.
+- Mention the company only using the JOB SUMMARY or the COMPANY FACTS. Do not praise the company with facts you were not given.
+- Write ONLY the body paragraphs for the email: no greeting, no sign-off, no subject line inside the body.
+- Email body: 90 to 130 words in at most 3 short paragraphs. (1) The role and why the candidate fits, naming 2 or 3 strengths from the resume that match the job keywords. (2) One concrete project or achievement from the resume. (3) A clear, polite ask, such as being considered or a short chat. Say that the resume is attached.
+- Avoid clichés such as "I hope this email finds you well", "passionate" and "dynamic". No exaggeration.
+- Plain text only: no markdown, no asterisks, no bullet symbols.
+OUTPUT FORMAT (exactly):
+SUBJECT_1: <clear subject, under 9 words, includes the job title>
+SUBJECT_2: <another option>
+SUBJECT_3: <another option>
+---EMAIL---
+<body paragraphs>
+---FOLLOWUP---
+<40 to 60 words, body only: a polite reminder to send about a week later>
+---LINKEDIN---
+<connection note under 280 characters, starting with "Hi <name>," if a recipient name was given, otherwise "Hi,">`;
+
+async function copyText(text, ta) {
+  try { await navigator.clipboard.writeText(text); }
+  catch { if (ta) { ta.select(); document.execCommand("copy"); } }
+}
+function prepareEmailBox(analysis) {
+  $("emailBox").hidden = false;
+  $("emailOut").replaceChildren();
+  setStatus("", false, "emailStatus");
+  $("emailTo").value = "";
+  $("emailName").value = sanitizeName(analysis.contact_person);
+}
+async function runEmail() {
+  if (!current) return;
+  const to = $("emailTo").value.trim();
+  if (to && !/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(to)) { setStatus("That email address does not look valid.", true, "emailStatus"); return; }
+  const { resume, userName } = await chrome.storage.local.get(["resume", "userName"]);
+  if (!resume) { setStatus("Upload or paste your resume first.", true, "emailStatus"); return; }
+  const { analysis, company } = current;
+  const confirmed = collectSkills();
+  const name = sanitizeName($("emailName").value);
+  const skillsText = confirmed.length
+    ? confirmed.map((c) => `- ${c.skill}${c.note ? ` (used in: ${c.note})` : ""}`).join("\n") : "(none)";
+  const facts = company && company.verified && company.summary ? company.summary : "(none)";
+  const btn = $("emailGen");
+  btn.disabled = true;
+  try {
+    setStatus("Writing your email...", false, "emailStatus");
+    const content = await withRetry(
+      () => callGroq([
+        { role: "system", content: EMAIL_SYSTEM },
+        { role: "user", content: `JOB TITLE: ${analysis.job_title}\nCOMPANY: ${analysis.company}\nJOB SUMMARY: ${analysis.jd_summary || ""}\nJOB KEYWORDS: ${(analysis.jd_keywords || []).join(", ")}\nCOMPANY FACTS (checked): ${facts}\nCONFIRMED SKILLS:\n${skillsText}\nRECIPIENT: ${$("emailRole").value}\nRECIPIENT NAME: ${name || "(not known)"}\nTONE: ${$("emailTone").value}\n\nRESUME:\n${resume.slice(0, 4000)}` },
+      ], { maxTokens: 1500 }),
+      (s) => setStatus(`Groq free-tier limit reached. Retrying in ${s}s...`, false, "emailStatus")
+    );
+    const parsed = parseColdEmail(content);
+    if (!parsed.body) throw new Error("The model returned an unreadable answer. Try again.");
+    renderEmailOut(parsed, { name, sign: userName });
+    setStatus("Read it, edit it, then open it in Gmail.", false, "emailStatus");
+  } catch (e) {
+    setStatus(e.message, true, "emailStatus");
+  } finally { btn.disabled = false; }
+}
+function textArea(id, value, rows) {
+  const ta = document.createElement("textarea");
+  ta.id = id; ta.rows = rows; ta.value = value;
+  return ta;
+}
+function renderEmailOut(p, ctx) {
+  const out = $("emailOut");
+  out.replaceChildren();
+  const subjects = p.subjects.length ? p.subjects.map(plain) : [`Application for ${plain(current.analysis.job_title) || "the role"}`];
+
+  const pick = document.createElement("select");
+  pick.id = "subjectPick";
+  subjects.forEach((t) => { const o = document.createElement("option"); o.value = t; o.textContent = t; pick.appendChild(o); });
+  const subj = document.createElement("input");
+  subj.type = "text"; subj.id = "emailSubject"; subj.value = subjects[0];
+  pick.addEventListener("change", () => { subj.value = pick.value; });
+  const subjLabel = el("label", "", "Subject"); subjLabel.htmlFor = "emailSubject";
+  const bodyLabel = el("label", "", "Email (you can edit it)"); bodyLabel.htmlFor = "emailBody";
+  const body = textArea("emailBody", assembleEmail(ctx.name, plain(p.body), ctx.sign), 12);
+
+  const row = el("div", "btn-row");
+  const gmail = el("button", "primary", "Open in Gmail");
+  const copy = el("button", "secondary", "Copy email");
+  gmail.style.marginTop = "8px"; gmail.style.width = "auto";
+  const msg = el("p", "hint", "Remember to attach your resume before you press Send.");
+  gmail.addEventListener("click", async () => {
+    const g = buildGmailUrl({ to: $("emailTo").value.trim(), subject: subj.value, body: body.value });
+    if (!g.bodyIncluded) {
+      await copyText(body.value, body);
+      msg.textContent = "The email was too long for a link, so it was copied. Paste it into the Gmail window, then attach your resume.";
+    } else msg.textContent = "Gmail opened in a new tab. Attach your resume before you press Send.";
+    chrome.tabs.create({ url: g.url });
+  });
+  copy.addEventListener("click", async () => {
+    await copyText(`Subject: ${subj.value}\n\n${body.value}`, body);
+    copy.textContent = "Copied";
+    setTimeout(() => (copy.textContent = "Copy email"), 1500);
+  });
+  row.append(gmail, copy);
+  out.append(subjLabel, pick, subj, bodyLabel, body, row, msg);
+
+  if (p.followup) {
+    const d = el("details");
+    d.appendChild(el("summary", "", "Follow-up (send after about a week)"));
+    const ta = textArea("followupText", assembleEmail(ctx.name, plain(p.followup), ctx.sign), 7);
+    const b = el("button", "secondary", "Copy follow-up");
+    b.addEventListener("click", async () => { await copyText(ta.value, ta); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy follow-up"), 1500); });
+    d.append(ta, b);
+    out.appendChild(d);
+  }
+  if (p.linkedin) {
+    const d = el("details");
+    d.appendChild(el("summary", "", "LinkedIn connection note"));
+    const note = plain(p.linkedin).slice(0, 300);
+    const ta = textArea("linkedinText", note, 4);
+    const count = el("div", "count", `${note.length}/300`);
+    ta.addEventListener("input", () => { count.textContent = `${ta.value.length}/300`; });
+    const b = el("button", "secondary", "Copy note");
+    b.addEventListener("click", async () => { await copyText(ta.value, ta); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy note"), 1500); });
+    d.append(ta, count, b);
+    out.appendChild(d);
+  }
+}
+$("emailGen").addEventListener("click", runEmail);
+
 /* ---------- analyze ---------- */
 $("analyze").addEventListener("click", async () => {
   const btn = $("analyze");
   btn.disabled = true;
   const id = ++runId;
-  ["results", "chatBox", "companyBox", "tailorBox"].forEach((x) => ($(x).hidden = true));
+  ["results", "chatBox", "companyBox", "tailorBox", "contactBox", "emailBox"].forEach((x) => ($(x).hidden = true));
   current = null; edits = [];
   try {
     const { resume } = await chrome.storage.local.get("resume");
@@ -713,7 +987,9 @@ $("analyze").addEventListener("click", async () => {
     $("chatLog").replaceChildren();
     $("chatBox").hidden = false;
 
-    checkCompany(analysis, page, id);   // runs in the background, fills the Company check box
+    const companyPromise = checkCompany(analysis, page, id);   // background: fills the Company check box
+    prepareEmailBox(analysis);
+    runContacts(analysis, page, id, companyPromise);            // background: fills the Contact emails box
   } catch (err) {
     setStatus(err.message, true);
   } finally {

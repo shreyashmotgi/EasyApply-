@@ -28,6 +28,8 @@
 
   <section class="box">
     <h2>Your resume</h2>
+    <label for="userName">Your name (signs your emails)</label>
+    <input id="userName" type="text" placeholder="e.g. Jane Doe" />
     <div id="resumeStatus" class="hint">No resume saved yet.</div>
     <input id="resumeFile" type="file" accept=".pdf,.txt,.md" />
     <details>
@@ -56,6 +58,30 @@
   <section id="results" hidden></section>
   <section id="companyBox" class="box" hidden></section>
   <section id="tailorBox" class="box" hidden></section>
+  <section id="contactBox" class="box" hidden></section>
+
+  <section id="emailBox" class="box" hidden>
+    <h2>Cold email</h2>
+    <p class="hint">Writes a short email from the job post, your resume and the skills you ticked above. It opens in Gmail on the web. You attach your resume and press Send yourself.</p>
+    <label for="emailTo">To</label>
+    <input id="emailTo" type="text" placeholder="recruiter@company.com (pick one above or type it)" />
+    <label for="emailName">Recipient name (optional)</label>
+    <input id="emailName" type="text" placeholder="Leave empty to write &quot;Hi Hiring Team&quot;" />
+    <label for="emailRole">Writing to</label>
+    <select id="emailRole">
+      <option value="a recruiter">Recruiter</option>
+      <option value="a hiring manager">Hiring manager</option>
+      <option value="a founder or senior leader">Founder or senior leader</option>
+    </select>
+    <label for="emailTone">Tone</label>
+    <select id="emailTone">
+      <option value="professional">Professional</option>
+      <option value="friendly but professional">Friendly</option>
+    </select>
+    <button id="emailGen" class="primary" style="margin-top:10px">Write email</button>
+    <div id="emailStatus" class="status" role="status"></div>
+    <div id="emailOut"></div>
+  </section>
 
   <section id="chatBox" class="box" hidden>
     <h2>Ask a follow-up</h2>
